@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${MBRL0901_ROOT:-/personal/jiayu2026/code/MBRL0901}"
-ENGINE_ROOT="${MBRL_ENGINE_ROOT:-/personal/jiayu2026/code/MBRL}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+ENGINE_ROOT="${MBRL_ENGINE_ROOT:-${ROOT}}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/personal/jiayu2026/models/Qwen2.5-VL-3B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
