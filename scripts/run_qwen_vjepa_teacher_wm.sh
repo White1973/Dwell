@@ -8,7 +8,8 @@ set -euo pipefail
 # paired replay.  This script never enables V-JEPA as the posterior input and
 # does not add world queries, BEV heads, or multi-frame query tokens.
 
-ROOT="${MBRL0901_ROOT:-/personal/jiayu2026/code/MBRL0901}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/personal/jiayu2026/models/Qwen2.5-VL-3B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
@@ -53,7 +54,7 @@ if [[ "${PHASE}" == "prepare" || "${PHASE}" == "all" ]]; then
   }
 fi
 
-export PYTHONPATH="${ROOT}:/personal/jiayu2026/code/MBRL${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTHONUNBUFFERED=1
 
