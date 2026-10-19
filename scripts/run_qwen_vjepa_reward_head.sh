@@ -5,7 +5,7 @@ set -euo pipefail
 # Qwen + V-JEPA-teacher World Model.  No visual data or WM is regenerated.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${MBRL0901_ROOT:-$(dirname -- "${SCRIPT_DIR}")}"
+ROOT="${DWELL_ROOT:-$(dirname -- "${SCRIPT_DIR}")}"
 ENGINE_ROOT="${MBRL_ENGINE_ROOT:-${ROOT}}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 GPU_ID="${GPU_ID:-0}"
