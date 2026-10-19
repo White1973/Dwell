@@ -1,0 +1,778 @@
+"""World model refresh trainer for alternating model-based RL.
+
+Performs supervised world model updates interleaved with PPO policy updates.
+Uses the existing Phase1Trainer.train_one_step() as the optimization backend
+but exposes a clean, decoupled interface.
+
+Design:
+  - Does NOT own the world model — receives it by reference.
+  - Does NOT know about PPO, policy, or collectors.
+  - Only responsibility: given a data sampler, run N supervised WM updates.
+  - Manages its own optimizer/scheduler state for checkpoint/resume.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
+
+import torch
+from torch import Tensor
+
+from sembelief_wm.config import Config, CurriculumConfig
+from sembelief_wm.types import SequenceBatch
+
+
+@dataclass
+class WMRefreshConfig:
+    """Configuration for world model refresh cycles."""
+
+    refresh_every: int = 10
+    """Refresh WM every N PPO updates. 0 = never refresh (frozen)."""
+
+    updates_per_refresh: int = 5
+    """Number of supervised gradient steps per refresh cycle."""
+
+    batch_size: int = 8
+    """Batch size (episodes) per supervised step."""
+
+    lr: float = 1e-4
+    """Learning rate for WM refresh optimizer."""
+
+    reward_head_lr_factor: float = 0.1
+    """Reward-head learning rate as a fraction of the WM refresh rate."""
+
+    base_lr_factor: float = 0.01
+    """Learning-rate multiplier for non-LoRA WM parameters."""
+
+    weight_decay: float = 0.01
+    """Weight decay for the independent WM refresh optimizer."""
+
+    warmup_steps: int = 100
+    """Number of WM optimizer steps used for linear warmup."""
+
+    grad_clip: float = 1.0
+    """Max gradient norm."""
+
+    horizon: int = 8
+    """Fixed supervised BPTT horizon used by every refresh step."""
+
+    reward_pos_weight: float | None = None
+    reward_loss_coef: float | None = None
+    validation_batches: int = 0
+    validation_guard_enabled: bool = False
+    validation_max_total_loss_increase: float = 0.05
+    validation_max_dynamics_loss_increase: float = 0.05
+    validation_max_open_dynamics_loss_increase: float = 0.10
+    validation_max_reward_f1_drop: float = 0.02
+    validation_min_effective_rank_ratio: float = 0.90
+    validation_loss_absolute_tolerance: float = 1e-4
+    max_consecutive_rejections: int = 3
+    continue_on_rejection: bool = False
+
+    open_dynamics_coef: float = 0.25
+    prior_reward_coef: float = 0.5
+    open_loop_horizon: int = 4
+    open_dynamics_decay: float = 0.9
+    prior_reward_decay: float = 1.0
+    delta_cosine_coef: float = 0.0
+    inverse_action_coef: float = 0.0
+    inverse_action_mode: str = "joint"
+    inverse_action_lr: float | None = None
+
+
+def make_phase1_refresh_config(config: Config) -> Config:
+    """Build the Phase-1 trainer view used only for Phase-2 WM refresh.
+
+    The world model itself is shared, but its refresh optimizer, scheduler,
+    gradient clipping and curriculum must be controlled by ``phase2.wm_refresh``
+    rather than by the original Phase-1 training schedule.  Returning a new
+    dataclass tree also avoids mutating the config used by the rest of Phase 2.
+    """
+    refresh = config.phase2.wm_refresh
+    if refresh.horizon <= 0:
+        raise ValueError("wm_refresh.horizon must be positive")
+    if refresh.warmup_steps < 0:
+        raise ValueError("wm_refresh.warmup_steps must be non-negative")
+    if refresh.grad_clip <= 0.0:
+        raise ValueError("wm_refresh.grad_clip must be positive")
+    if not 0.0 < refresh.reward_head_lr_factor <= 1.0:
+        raise ValueError("wm_refresh.reward_head_lr_factor must be in (0, 1]")
+    if refresh.reward_pos_weight is not None and refresh.reward_pos_weight <= 0.0:
+        raise ValueError("wm_refresh.reward_pos_weight must be positive")
+    if refresh.reward_loss_coef is not None and refresh.reward_loss_coef < 0.0:
+        raise ValueError("wm_refresh.reward_loss_coef must be non-negative")
+    if refresh.validation_batches < 0:
+        raise ValueError("wm_refresh.validation_batches must be non-negative")
+    if refresh.validation_guard_enabled and refresh.validation_batches <= 0:
+        raise ValueError(
+            "wm_refresh.validation_guard_enabled requires validation_batches > 0"
+        )
+    for name in (
+        "validation_max_total_loss_increase",
+        "validation_max_dynamics_loss_increase",
+        "validation_max_open_dynamics_loss_increase",
+        "validation_max_reward_f1_drop",
+        "validation_loss_absolute_tolerance",
+    ):
+        if getattr(refresh, name) < 0.0:
+            raise ValueError(f"wm_refresh.{name} must be non-negative")
+    if not 0.0 < refresh.validation_min_effective_rank_ratio <= 1.0:
+        raise ValueError(
+            "wm_refresh.validation_min_effective_rank_ratio must be in (0, 1]"
+        )
+    if refresh.max_consecutive_rejections <= 0:
+        raise ValueError("wm_refresh.max_consecutive_rejections must be positive")
+    if refresh.open_dynamics_coef < 0.0 or refresh.prior_reward_coef < 0.0:
+        raise ValueError("WM open-loop loss coefficients must be non-negative")
+    if refresh.open_loop_horizon < 0:
+        raise ValueError("wm_refresh.open_loop_horizon must be non-negative")
+    if not 0.0 < refresh.open_dynamics_decay <= 1.0:
+        raise ValueError("wm_refresh.open_dynamics_decay must be in (0, 1]")
+    if not 0.0 < refresh.prior_reward_decay <= 1.0:
+        raise ValueError("wm_refresh.prior_reward_decay must be in (0, 1]")
+    if refresh.delta_cosine_coef < 0.0 or refresh.inverse_action_coef < 0.0:
+        raise ValueError("WM action-grounding coefficients must be non-negative")
+    if refresh.inverse_action_mode not in {"joint", "prior_frozen"}:
+        raise ValueError("wm_refresh.inverse_action_mode must be joint or prior_frozen")
+    if refresh.inverse_action_lr is not None and refresh.inverse_action_lr <= 0.0:
+        raise ValueError("wm_refresh.inverse_action_lr must be positive")
+
+    training = replace(
+        config.training,
+        episodes_per_step=refresh.batch_size,
+        lr=refresh.lr,
+        reward_head_lr_factor=refresh.reward_head_lr_factor,
+        base_lr_factor=refresh.base_lr_factor,
+        weight_decay=refresh.weight_decay,
+        warmup_steps=refresh.warmup_steps,
+        grad_clip=refresh.grad_clip,
+        lambda_reward=(
+            config.training.lambda_reward
+            if refresh.reward_loss_coef is None
+            else refresh.reward_loss_coef
+        ),
+        open_dynamics_coef=refresh.open_dynamics_coef,
+        prior_reward_coef=refresh.prior_reward_coef,
+        open_loop_horizon=refresh.open_loop_horizon,
+        open_dynamics_decay=refresh.open_dynamics_decay,
+        prior_reward_decay=refresh.prior_reward_decay,
+        delta_cosine_coef=refresh.delta_cosine_coef,
+        inverse_action_coef=refresh.inverse_action_coef,
+        inverse_action_mode=refresh.inverse_action_mode,
+        inverse_action_lr=refresh.inverse_action_lr,
+    )
+    curriculum = CurriculumConfig(
+        horizons=[refresh.horizon],
+        switch_steps=[0],
+        horizon_decay=config.curriculum.horizon_decay,
+    )
+    reward = (
+        config.reward
+        if refresh.reward_pos_weight is None
+        else replace(config.reward, pos_weight=refresh.reward_pos_weight)
+    )
+    return replace(
+        config,
+        training=training,
+        curriculum=curriculum,
+        reward=reward,
+    )
+
+
+@dataclass
+class RefreshMetrics:
+    """Metrics from one refresh cycle."""
+
+    num_steps: int
+    avg_dynamics_loss: float
+    avg_reward_loss: float
+    avg_total_loss: float
+    refresh_step: int
+    diagnostics: dict[str, float] = field(default_factory=dict)
+
+
+def _clone_cpu(value: Any) -> Any:
+    """Clone nested optimizer/module state without retaining accelerator storage."""
+    if isinstance(value, Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _clone_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_cpu(item) for item in value)
+    return copy.deepcopy(value)
+
+
+class _RefreshTransaction:
+    """Snapshot optimizer-owned WM tensors and all stateful WM buffers.
+
+    Frozen Qwen base parameters are deliberately excluded, so a transaction
+    does not duplicate the multi-billion-parameter backbone. Buffers are
+    restored by qualified name rather than by stale object reference; this is
+    required for SIGReg's dynamically resized running buffer.
+    """
+
+    def __init__(self, trainer: Any, parameter_names: tuple[str, ...] | None) -> None:
+        self._trainer = trainer
+        world_model = trainer.world_model
+        named_parameters = dict(world_model.named_parameters())
+        optimizer_parameter_ids = {
+            id(parameter)
+            for group in trainer.optimizer.param_groups
+            for parameter in group.get("params", ())
+        }
+        optimizer_names = {
+            name
+            for name, parameter in named_parameters.items()
+            if id(parameter) in optimizer_parameter_ids
+        }
+        names = (
+            tuple(named_parameters)
+            if parameter_names is None
+            else tuple(set(parameter_names) | optimizer_names)
+        )
+        self.parameters = {
+            name: named_parameters[name].detach().cpu().clone()
+            for name in names
+            if name in named_parameters
+        }
+        self.buffers = {
+            name: buffer.detach().cpu().clone()
+            for name, buffer in world_model.named_buffers()
+        }
+        self.optimizer = _clone_cpu(trainer.optimizer.state_dict())
+        self.scheduler = _clone_cpu(trainer.scheduler.state_dict())
+
+    @staticmethod
+    def _restore_buffer(root: Any, name: str, source: Tensor) -> None:
+        parts = name.split(".")
+        parent = root
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        leaf = parts[-1]
+        current = parent._buffers.get(leaf)
+        if current is None:
+            raise RuntimeError(f"WM buffer disappeared during refresh: {name}")
+        restored = source.to(device=current.device, dtype=current.dtype)
+        if current.shape == restored.shape:
+            current.copy_(restored)
+        else:
+            # RunningBuffer._storage is intentionally shape-dynamic.
+            parent._buffers[leaf] = restored.clone()
+
+    def restore(self) -> None:
+        world_model = self._trainer.world_model
+        current_parameters = dict(world_model.named_parameters())
+        with torch.no_grad():
+            for name, source in self.parameters.items():
+                target = current_parameters.get(name)
+                if target is None:
+                    raise RuntimeError(
+                        f"WM parameter disappeared during refresh: {name}"
+                    )
+                target.copy_(source.to(device=target.device, dtype=target.dtype))
+            for name, source in self.buffers.items():
+                self._restore_buffer(world_model, name, source)
+        self._trainer.optimizer.load_state_dict(self.optimizer)
+        self._trainer.scheduler.load_state_dict(self.scheduler)
+        world_model.eval()
+
+
+class WorldModelRefresher:
+    """Runs supervised WM updates using Phase1Trainer as backend.
+
+    This is a thin wrapper that:
+      1. Toggles requires_grad on the world model
+      2. Calls Phase1Trainer.train_one_step() for N steps
+      3. Restores eval mode when done
+
+    The Phase1Trainer is created externally and passed in — this class
+    does NOT construct optimizers or schedulers. It just drives the
+    existing training infrastructure.
+    """
+
+    def __init__(
+        self,
+        phase1_trainer: Any,
+        config: WMRefreshConfig,
+        validation_fn: Callable[[int], dict[str, float]] | None = None,
+    ) -> None:
+        """
+        Args:
+            phase1_trainer: An instance of sembelief_wm.train.trainer.Phase1Trainer.
+                           We use Any to avoid importing it (keeps this module
+                           decoupled from the full training infrastructure).
+            config: Refresh configuration.
+        """
+        self._trainer = phase1_trainer
+        self._config = config
+        self._validation_fn = validation_fn
+        self._refresh_step = 0
+        self._refresh_attempts = 0
+        self._accepted_refreshes = 0
+        self._rejected_refreshes = 0
+        self._consecutive_rejections = 0
+        self._last_rejection_reasons: tuple[str, ...] = ()
+        if config.validation_guard_enabled and validation_fn is None:
+            raise ValueError(
+                "validation_guard_enabled requires a fixed validation_fn"
+            )
+        world_model = phase1_trainer.world_model
+        named_parameters = getattr(world_model, "named_parameters", None)
+        self._supervised_param_names: tuple[str, ...] | None = None
+        if callable(named_parameters):
+            # Capture the Phase-1 trainability mask before the Phase-2 assembly
+            # freezes the WM.  In a PEFT model this contains LoRA parameters and
+            # the small WM heads, while the Qwen base weights remain excluded.
+            self._supervised_param_names = tuple(
+                name
+                for name, param in named_parameters()
+                if param.requires_grad
+            )
+        initial_validation = validation_fn(0) if validation_fn is not None else {}
+        self._validation_baseline = self._normalize_validation(initial_validation)
+        self._accepted_validation_reference = dict(self._validation_baseline)
+        if validation_fn is not None:
+            world_model.requires_grad_(False)
+            world_model.eval()
+
+    @property
+    def refresh_step(self) -> int:
+        return self._refresh_step
+
+    def evaluate_validation(self) -> dict[str, float]:
+        """Evaluate the current shared WM on the fixed held-out replay.
+
+        This is intentionally independent of ``refresh()`` so semantic probes
+        can evaluate a resumed checkpoint without taking an optimizer step.
+        """
+        if self._validation_fn is None:
+            return {}
+        wm = self._trainer.world_model
+        ownership = {
+            name: parameter.requires_grad
+            for name, parameter in wm.named_parameters()
+        }
+        try:
+            metrics = self._validation_fn(self._refresh_step)
+        finally:
+            current = dict(wm.named_parameters())
+            for name, requires_grad in ownership.items():
+                current[name].requires_grad_(requires_grad)
+            wm.eval()
+        return self._normalize_validation(metrics)
+
+    @staticmethod
+    def _normalize_validation(metrics: dict[str, float]) -> dict[str, float]:
+        return {
+            (key[4:] if key.startswith("val/") else key): float(value)
+            for key, value in metrics.items()
+        }
+
+    def _validation_failures(
+        self,
+        candidate: dict[str, float],
+        reference: dict[str, float],
+        reference_name: str,
+    ) -> list[str]:
+        """Return acceptance-rule violations against one reference panel."""
+        failures = [
+            f"{reference_name}:non_finite:{key}"
+            for key, value in candidate.items()
+            if not math.isfinite(value)
+        ]
+        cfg = self._config
+        loss_rules = {
+            "loss/total": cfg.validation_max_total_loss_increase,
+            "loss/dynamics": cfg.validation_max_dynamics_loss_increase,
+            "loss/open_dynamics": cfg.validation_max_open_dynamics_loss_increase,
+        }
+        for key, relative_limit in loss_rules.items():
+            before = reference.get(key)
+            after = candidate.get(key)
+            if before is not None and after is None:
+                failures.append(f"{reference_name}:missing:{key}")
+                continue
+            if before is None or after is None or not math.isfinite(after):
+                continue
+            limit = (
+                before
+                + abs(before) * relative_limit
+                + cfg.validation_loss_absolute_tolerance
+            )
+            if after > limit:
+                failures.append(
+                    f"{reference_name}:{key}:{after:.6g}>{limit:.6g}"
+                )
+
+        positives_before = reference.get("metric/reward_positive_count", 0.0)
+        positives_after = candidate.get("metric/reward_positive_count", 0.0)
+        reward_before = reference.get("metric/reward_f1_pri")
+        reward_after = candidate.get("metric/reward_f1_pri")
+        if (
+            positives_before > 0.0
+            and reward_before is not None
+            and reward_after is None
+        ):
+            failures.append(
+                f"{reference_name}:missing:metric/reward_f1_pri"
+            )
+        if (
+            positives_before > 0.0
+            and positives_after > 0.0
+            and reward_before is not None
+            and reward_after is not None
+            and math.isfinite(reward_after)
+            and reward_after
+            < reward_before - cfg.validation_max_reward_f1_drop
+        ):
+            failures.append(
+                f"{reference_name}:metric/reward_f1_pri:"
+                f"{reward_after:.6g}<"
+                f"{reward_before - cfg.validation_max_reward_f1_drop:.6g}"
+            )
+
+        rank_before = reference.get("metric/effective_rank")
+        rank_after = candidate.get("metric/effective_rank")
+        if rank_before is not None and rank_after is None:
+            failures.append(
+                f"{reference_name}:missing:metric/effective_rank"
+            )
+        if (
+            rank_before is not None
+            and rank_before > 0.0
+            and rank_after is not None
+            and math.isfinite(rank_after)
+            and rank_after
+            < rank_before * cfg.validation_min_effective_rank_ratio
+        ):
+            failures.append(
+                f"{reference_name}:metric/effective_rank:"
+                f"{rank_after:.6g}<"
+                f"{rank_before * cfg.validation_min_effective_rank_ratio:.6g}"
+            )
+        return failures
+
+    def should_refresh(self, ppo_update: int) -> bool:
+        """Whether to refresh WM at this PPO update step."""
+        if self._config.refresh_every <= 0:
+            return False
+        return ppo_update > 0 and ppo_update % self._config.refresh_every == 0
+
+    def refresh(
+        self,
+        sample_fn: callable,
+    ) -> RefreshMetrics:
+        """Run one refresh cycle of supervised WM updates.
+
+        Args:
+            sample_fn: Callable that returns a SequenceBatch when called
+                       with (batch_size: int). This decouples the refresher
+                       from the specific data source (offline, online, mixed).
+
+        Returns:
+            RefreshMetrics with averaged losses over the cycle.
+        """
+        wm = self._trainer.world_model
+        self._refresh_attempts += 1
+        pre_validation = self.evaluate_validation()
+        refresh_step_before = self._refresh_step
+        transaction = (
+            _RefreshTransaction(self._trainer, self._supervised_param_names)
+            if self._config.validation_guard_enabled
+            else None
+        )
+        named_parameters = getattr(wm, "named_parameters", None)
+        outside_refresh_ownership = (
+            {
+                name: parameter.requires_grad
+                for name, parameter in named_parameters()
+            }
+            if callable(named_parameters)
+            else {}
+        )
+
+        # Restore the original Phase-1 trainability mask.  A blanket
+        # ``requires_grad_(True)`` would also unfreeze the PEFT/Qwen base model
+        # and turn an intended LoRA refresh into full-model fine-tuning.
+        wm.requires_grad_(False)
+        if self._supervised_param_names is None:
+            # Compatibility path for lightweight protocol fakes.
+            wm.requires_grad_(True)
+        else:
+            current_parameters = dict(wm.named_parameters())
+            missing = [
+                name for name in self._supervised_param_names
+                if name not in current_parameters
+            ]
+            if missing:
+                raise RuntimeError(
+                    "World-model parameter set changed after refresher "
+                    f"initialization; missing {missing[:3]}"
+                )
+            for name in self._supervised_param_names:
+                current_parameters[name].requires_grad_(True)
+        refresh_error: BaseException | None = None
+        try:
+            totals: dict[str, float] = {}
+            for _ in range(self._config.updates_per_refresh):
+                batch: SequenceBatch = sample_fn(self._config.batch_size)
+                step_metrics = self._trainer.train_one_step(
+                    global_step=self._refresh_step,
+                    batch=batch,
+                )
+                metrics_dict = step_metrics.as_dict()
+                self._refresh_step += 1
+                for key, value in metrics_dict.items():
+                    totals[key] = totals.get(key, 0.0) + float(value)
+        except BaseException as error:
+            refresh_error = error
+            if transaction is not None:
+                transaction.restore()
+                self._refresh_step = refresh_step_before
+                self._rejected_refreshes += 1
+                self._consecutive_rejections += 1
+                self._last_rejection_reasons = (
+                    f"refresh_exception:{type(error).__name__}",
+                )
+        finally:
+            # The PEFT container also owns PPO's actor/critic LoRA adapters.
+            # A blanket freeze here would silently disable PPO after the first
+            # alternating refresh. Restore the exact pre-refresh ownership;
+            # Phase-1/WM parameters were already frozen by pipeline assembly,
+            # while PPO-owned LoRAs remain trainable.
+            if callable(named_parameters):
+                current_parameters = dict(named_parameters())
+                for name, requires_grad in outside_refresh_ownership.items():
+                    current_parameters[name].requires_grad_(requires_grad)
+            else:
+                # Lightweight protocol fakes do not expose per-parameter
+                # ownership; preserve the historical contract by freezing the
+                # whole object after the supervised refresh.
+                wm.requires_grad_(False)
+            wm.eval()
+        if refresh_error is not None:
+            raise refresh_error
+
+        n = max(1, self._config.updates_per_refresh)
+
+        def avg(key: str) -> float:
+            return totals.get(key, 0.0) / n
+
+        positive_count = totals.get("metric/reward_positive_count", 0.0)
+        valid_count = totals.get("metric/reward_valid_count", 0.0)
+        tp_post = totals.get("metric/reward_true_positive_count_post", 0.0)
+        tp_pri = totals.get("metric/reward_true_positive_count_pri", 0.0)
+        predicted_post = totals.get(
+            "metric/reward_predicted_positive_count_post", 0.0
+        )
+        predicted_pri = totals.get(
+            "metric/reward_predicted_positive_count_pri", 0.0
+        )
+        tpr_post = tp_post / max(positive_count, 1.0)
+        tpr_pri = tp_pri / max(positive_count, 1.0)
+        precision_post = tp_post / max(predicted_post, 1.0)
+        precision_pri = tp_pri / max(predicted_pri, 1.0)
+
+        def f1(precision: float, recall: float) -> float:
+            return 0.0 if precision + recall == 0.0 else (
+                2.0 * precision * recall / (precision + recall)
+            )
+
+        current_lrs = self._trainer.scheduler.get_last_lr()
+        named_lrs = {
+            group.get("group_name", f"group_{index}"): current_lrs[index]
+            for index, group in enumerate(self._trainer.optimizer.param_groups)
+        }
+        diagnostics = {
+            # Reward-head classification quality. Counts are summed over every
+            # supervised minibatch in this refresh; rates are therefore
+            # micro-averaged and remain meaningful with sparse positives.
+            "reward/tpr_post": tpr_post,
+            "reward/tpr_prior": tpr_pri,
+            "reward/precision_post": precision_post,
+            "reward/precision_prior": precision_pri,
+            "reward/f1_post": f1(precision_post, tpr_post),
+            "reward/f1_prior": f1(precision_pri, tpr_pri),
+            "reward/accuracy_post": avg("metric/reward_acc_post"),
+            "reward/accuracy_prior": avg("metric/reward_acc_pri"),
+            "reward/auroc_post": avg("metric/reward_auroc_post"),
+            "reward/auroc_prior": avg("metric/reward_auroc_pri"),
+            "reward/brier_post": avg("metric/reward_brier_post"),
+            "reward/brier_prior": avg("metric/reward_brier_pri"),
+            "reward/positive_rate": (
+                positive_count / max(valid_count, 1.0)
+            ),
+            "reward/positive_count": positive_count,
+            "reward/valid_count": valid_count,
+            "reward/true_positive_count_post": tp_post,
+            "reward/true_positive_count_prior": tp_pri,
+            "reward/predicted_positive_count_post": predicted_post,
+            "reward/predicted_positive_count_prior": predicted_pri,
+            "reward/logit_mean_post": avg("metric/reward_logit_mean_post"),
+            "reward/logit_mean_prior": avg("metric/reward_logit_mean_pri"),
+            "reward/logit_gap": avg("metric/reward_logit_gap"),
+            # Dynamics and representation diagnostics make it possible to see
+            # whether online refresh improves reward prediction by collapsing
+            # or degrading the latent transition model.
+            "dynamics/cosine_similarity": avg("metric/cosine_sim"),
+            "dynamics/posterior_prior_l2": avg("metric/posterior_prior_l2"),
+            "open_loop/dynamics_loss": avg("loss/open_dynamics"),
+            "open_loop/prior_reward_loss": avg("loss/open_prior_reward"),
+            "open_loop/horizon": avg("open_loop/horizon"),
+            "open_loop/dynamics_valid_count": avg(
+                "open_loop/dynamics_valid_count"
+            ),
+            "open_loop/reward_valid_count": avg(
+                "open_loop/reward_valid_count"
+            ),
+            "open_loop/prior_reward_accuracy": avg(
+                "open_loop/prior_reward_accuracy"
+            ),
+            "open_loop/prior_reward_positive_rate": avg(
+                "open_loop/prior_reward_positive_rate"
+            ),
+            "belief/effective_rank": avg("metric/effective_rank"),
+            "belief/std_mean": avg("metric/belief_std_mean"),
+            "belief/std_min": avg("metric/belief_std_min"),
+            "optimization/grad_norm": avg("metric/grad_norm"),
+            "optimization/lr": float(
+                named_lrs.get("wm_adaptation", current_lrs[0])
+            ),
+            "optimization/reward_head_lr": float(
+                named_lrs.get("reward_head", 0.0)
+            ),
+            "optimization/grad_clip": float(self._config.grad_clip),
+            "curriculum/horizon": avg("curriculum/horizon"),
+        }
+        try:
+            post_validation = self.evaluate_validation()
+        except BaseException as error:
+            if transaction is not None:
+                transaction.restore()
+                self._refresh_step = refresh_step_before
+                self._rejected_refreshes += 1
+                self._consecutive_rejections += 1
+                self._last_rejection_reasons = (
+                    f"validation_exception:{type(error).__name__}",
+                )
+                current_parameters = dict(wm.named_parameters())
+                for name, requires_grad in outside_refresh_ownership.items():
+                    current_parameters[name].requires_grad_(requires_grad)
+                wm.eval()
+            raise
+        if self._validation_fn is not None:
+            for key, value in self._validation_baseline.items():
+                diagnostics[f"validation_baseline/{key}"] = value
+            for key, value in pre_validation.items():
+                diagnostics[f"validation_pre/{key}"] = value
+            for key, value in post_validation.items():
+                diagnostics[f"validation/{key}"] = value
+                baseline_value = self._validation_baseline.get(key)
+                if baseline_value is not None:
+                    diagnostics[f"validation_delta/{key}"] = value - baseline_value
+
+        accepted = True
+        failures: list[str] = []
+        if transaction is not None:
+            failures.extend(
+                self._validation_failures(post_validation, pre_validation, "pre")
+            )
+            failures.extend(
+                self._validation_failures(
+                    post_validation, self._validation_baseline, "initial"
+                )
+            )
+            accepted = not failures
+            if accepted:
+                self._accepted_refreshes += 1
+                self._consecutive_rejections = 0
+                self._last_rejection_reasons = ()
+                self._accepted_validation_reference = dict(post_validation)
+            else:
+                transaction.restore()
+                self._refresh_step = refresh_step_before
+                self._rejected_refreshes += 1
+                self._consecutive_rejections += 1
+                self._last_rejection_reasons = tuple(failures)
+                print(
+                    "[wm-refresh] rejected candidate and restored transaction: "
+                    + "; ".join(failures)
+                )
+                current_parameters = dict(wm.named_parameters())
+                for name, requires_grad in outside_refresh_ownership.items():
+                    current_parameters[name].requires_grad_(requires_grad)
+                wm.eval()
+        else:
+            self._accepted_refreshes += 1
+            self._consecutive_rejections = 0
+
+        stop_requested = (
+            not accepted
+            and self._consecutive_rejections
+            >= self._config.max_consecutive_rejections
+            and not self._config.continue_on_rejection
+        )
+        diagnostics.update({
+            "guard/enabled": float(transaction is not None),
+            "guard/accepted": float(accepted),
+            "guard/rejected": float(not accepted),
+            "guard/failure_count": float(len(failures)),
+            "guard/attempts": float(self._refresh_attempts),
+            "guard/accepted_refreshes": float(self._accepted_refreshes),
+            "guard/rejected_refreshes": float(self._rejected_refreshes),
+            "guard/consecutive_rejections": float(self._consecutive_rejections),
+            "guard/stop_requested": float(stop_requested),
+        })
+        return RefreshMetrics(
+            num_steps=n,
+            avg_dynamics_loss=avg("loss/dynamics"),
+            avg_reward_loss=avg("loss/reward"),
+            avg_total_loss=avg("loss/total"),
+            refresh_step=self._refresh_step,
+            diagnostics=diagnostics,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "refresh_step": self._refresh_step,
+            "refresh_attempts": self._refresh_attempts,
+            "accepted_refreshes": self._accepted_refreshes,
+            "rejected_refreshes": self._rejected_refreshes,
+            "consecutive_rejections": self._consecutive_rejections,
+            "validation_baseline": self._validation_baseline,
+            "accepted_validation_reference": self._accepted_validation_reference,
+            "last_rejection_reasons": self._last_rejection_reasons,
+            "optimizer": self._trainer.optimizer.state_dict(),
+            "scheduler": self._trainer.scheduler.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._refresh_step = int(state_dict.get("refresh_step", 0))
+        self._refresh_attempts = int(state_dict.get("refresh_attempts", 0))
+        self._accepted_refreshes = int(state_dict.get("accepted_refreshes", 0))
+        self._rejected_refreshes = int(state_dict.get("rejected_refreshes", 0))
+        self._consecutive_rejections = int(
+            state_dict.get("consecutive_rejections", 0)
+        )
+        self._validation_baseline = dict(
+            state_dict.get("validation_baseline", self._validation_baseline)
+        )
+        self._accepted_validation_reference = dict(
+            state_dict.get(
+                "accepted_validation_reference", self._validation_baseline
+            )
+        )
+        self._last_rejection_reasons = tuple(
+            state_dict.get("last_rejection_reasons", ())
+        )
+        opt_state = state_dict.get("optimizer")
+        if opt_state is not None:
+            self._trainer.optimizer.load_state_dict(opt_state)
+        sched_state = state_dict.get("scheduler")
+        if sched_state is not None:
+            self._trainer.scheduler.load_state_dict(sched_state)
