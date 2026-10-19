@@ -9,8 +9,9 @@ set -euo pipefail
 # Teacher target: frozen V-JEPA features in semantic_teacher_tokens [T,36,1408]
 # V-JEPA is never passed to the posterior as the observation input.
 
-ROOT="${MBRL0901_ROOT:-/personal/jiayu2026/code/MBRL0901}"
-ENGINE_ROOT="${MBRL_ENGINE_ROOT:-/personal/jiayu2026/code/MBRL}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+ENGINE_ROOT="${MBRL_ENGINE_ROOT:-${ROOT}}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 VAGEN_ROOT="${VAGEN_ROOT:-/personal/jiayu2026/code/VAGEN-new}"
 MODEL_PATH="${MODEL_PATH:-/personal/jiayu2026/models/Qwen2.5-VL-3B-Instruct}"
