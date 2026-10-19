@@ -6,7 +6,8 @@ set -euo pipefail
 # independent `wm_prior` LoRA is optimized using held-out-safe dynamics and
 # frozen V-JEPA future-state/delta teacher targets.
 
-ROOT="${MBRL0901_ROOT:-MBRL0901}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/personal/jiayu2026/models/Qwen2.5-VL-3B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
@@ -43,7 +44,7 @@ esac
 [[ -f "${MODEL_PATH}/config.json" ]] || { echo "Missing Qwen model: ${MODEL_PATH}" >&2; exit 2; }
 [[ -f "${DATA_DIR}/manifest.jsonl" ]] || { echo "Missing paired replay: ${DATA_DIR}/manifest.jsonl" >&2; exit 2; }
 
-export PYTHONPATH="${ROOT}:/personal/jiayu2026/code/MBRL${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTHONUNBUFFERED=1
 
