@@ -5,7 +5,7 @@ set -euo pipefail
 # This is a separate experiment branch; the frozen-WM runner and checkpoints
 # remain unchanged. The first pilot stops at 150 accepted Actor updates.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${MBRL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 SEED="${SEED:-1}"
 
 export WORLD_MODEL_MODE=alternating_wm
@@ -14,8 +14,8 @@ export ACTOR_UPDATES="${ACTOR_UPDATES:-500}"
 export EVAL_EVERY="${EVAL_EVERY:-10}"
 export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 
-# Refresh the shared posterior/prior WM parameters and Reward Head from real
-# replay before imagination. PPO itself still updates only Actor and Critic.
+# Refresh the independent prior-LoRA WM branch and Reward Head from real replay
+# before imagination. PPO itself still updates only Actor and Critic.
 export WM_REFRESH_EVERY="${WM_REFRESH_EVERY:-50}"
 export WM_REFRESH_UPDATES="${WM_REFRESH_UPDATES:-1}"
 export WM_REFRESH_BATCH_SIZE="${WM_REFRESH_BATCH_SIZE:-16}"
@@ -25,7 +25,7 @@ export WM_REFRESH_REWARD_LOSS_COEF="${WM_REFRESH_REWARD_LOSS_COEF:-0.1}"
 export WM_REFRESH_HORIZON="${WM_REFRESH_HORIZON:-2}"
 export WM_OPEN_LOOP_HORIZON="${WM_OPEN_LOOP_HORIZON:-2}"
 export ROLLOUT_HORIZON="${ROLLOUT_HORIZON:-2}"
-export PRIOR_ISOLATION_MODE="${PRIOR_ISOLATION_MODE:-shared}"
+export PRIOR_ISOLATION_MODE="${PRIOR_ISOLATION_MODE:-lora}"
 export WM_REFRESH_WARMUP_STEPS="${WM_REFRESH_WARMUP_STEPS:-0}"
 export WM_REFRESH_GRAD_CLIP="${WM_REFRESH_GRAD_CLIP:-0.5}"
 export WM_REFRESH_VALIDATION_BATCHES="${WM_REFRESH_VALIDATION_BATCHES:-8}"
