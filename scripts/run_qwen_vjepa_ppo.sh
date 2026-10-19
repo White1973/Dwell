@@ -5,15 +5,16 @@ set -euo pipefail
 # The baseline is Actor update 0. Training, evaluation, W&B and checkpoint
 # schedules advance only after an Actor PPO transaction is accepted.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${MBRL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 ENGINE_ROOT="${MBRL_ENGINE_ROOT:-${ROOT}}"
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
+PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/personal/jiayu2026/models/Qwen2.5-VL-3B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-1}"
 RESUME="${RESUME:-0}"
 WORLD_MODEL_MODE="${WORLD_MODEL_MODE:-frozen_wm}"
 ENV_ID="${ENV_ID:-sokoban}"
+PRIOR_ISOLATION_MODE="${PRIOR_ISOLATION_MODE:-lora}"
 
 REWARD_CKPT="${REWARD_CKPT:-${ROOT}/checkpoints/qwen_vjepa_teacher_seed${SEED}/stage2_reward_head/best.pt}"
 CRITIC_DIR="${CRITIC_DIR:-${ROOT}/checkpoints/qwen_vjepa_teacher_seed${SEED}/stage3_critic_warmup}"
@@ -60,6 +61,10 @@ esac
   echo "WORLD_MODEL_MODE must be frozen_wm or alternating_wm; got ${WORLD_MODEL_MODE}" >&2
   exit 2
 }
+[[ "${PRIOR_ISOLATION_MODE}" == "lora" ]] || {
+  echo "PRIOR_ISOLATION_MODE must be lora to match the Stage-3 checkpoint; got ${PRIOR_ISOLATION_MODE}" >&2
+  exit 2
+}
 [[ -x "${PYTHON_BIN}" ]] || { echo "Missing Python: ${PYTHON_BIN}" >&2; exit 2; }
 
 export PYTHONPATH="${ROOT}:${ENGINE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -82,6 +87,9 @@ fi
 wm_mode_args=(--world-model-mode "${WORLD_MODEL_MODE}")
 if [[ "${WORLD_MODEL_MODE}" == "alternating_wm" ]]; then
   wm_mode_args+=(
+    # Preserve Stage-1/3 adapter ownership: only the independent wm_prior
+    # LoRA and Reward Head may be refreshed; PPO never shares that adapter.
+    --wm-refresh-prior-lora-only
     --wm-refresh-every "${WM_REFRESH_EVERY:-50}"
     --wm-refresh-updates "${WM_REFRESH_UPDATES:-1}"
     --wm-refresh-batch-size "${WM_REFRESH_BATCH_SIZE:-16}"
@@ -206,7 +214,7 @@ echo "metric x-axis    : actor_ppo_update (baseline=0, first accepted update=1)"
 echo "evaluation       : ${eval_protocol} at Actor 1, then every ${EVAL_EVERY} updates"
 echo "checkpoint       : latest.pt every ${CHECKPOINT_EVERY}; best.pt by eval success"
 if [[ "${WORLD_MODEL_MODE}" == "alternating_wm" ]]; then
-  echo "WM/Reward refresh: shared WM + Reward Head every ${WM_REFRESH_EVERY:-50} Actor updates; ${WM_REFRESH_UPDATES:-1} step(s), wm_lr=${WM_REFRESH_LR:-1e-6}, reward_lr_factor=${WM_REFRESH_REWARD_HEAD_LR_FACTOR:-0.1}"
+  echo "WM/Reward refresh: independent prior-LoRA WM + Reward Head every ${WM_REFRESH_EVERY:-50} Actor updates; ${WM_REFRESH_UPDATES:-1} step(s), wm_lr=${WM_REFRESH_LR:-1e-6}, reward_lr_factor=${WM_REFRESH_REWARD_HEAD_LR_FACTOR:-0.1}"
 fi
 echo "W&B              : ${WANDB_PROJECT:-jiayu-mbrl}/${WANDB_GROUP:-qwen_vjepa_ppo}"
 echo "resume           : ${resume_args[*]:-fresh run}"
@@ -223,7 +231,7 @@ echo "resume           : ${resume_args[*]:-fresh run}"
   --posterior-grounding-mode visual_anchor \
   --posterior-recurrent-residual-scale 0.25 \
   --posterior-action-free \
-  --prior-isolation-mode "${PRIOR_ISOLATION_MODE:-shared}" \
+  --prior-isolation-mode "${PRIOR_ISOLATION_MODE}" \
   --posterior-observation-residual-scale 0 \
   --vjepa-teacher-prior-coef 0.5 \
   --vjepa-teacher-posterior-coef 0 \
