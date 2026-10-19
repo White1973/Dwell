@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${MBRL0901_ROOT:-/personal/jiayu2026/code/MBRL0901}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-11}"
@@ -24,7 +25,7 @@ DATA_SEED_START="${DATA_SEED_START:-1}"
 [[ -f "${DATA_DIR}/manifest.jsonl" ]] || { echo "Missing paired replay: ${DATA_DIR}" >&2; exit 2; }
 [[ -f "${MODEL_PATH}/config.json" ]] || { echo "Missing Qwen model: ${MODEL_PATH}" >&2; exit 2; }
 
-export PYTHONPATH="${ROOT}:/personal/jiayu2026/code/MBRL${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTHONUNBUFFERED=1
 mkdir -p "${OUTPUT_DIR}"
@@ -67,7 +68,7 @@ echo "W&B             : ${WANDB_PROJECT:-jiayu-mbrl}/${WANDB_GROUP:-frozenlake_q
   --enforce
 
 run_train() {
-  "${PYTHON_BIN}" -u "${ROOT}/scripts/frozenlake/run_qwen_vjepa_spatial_prior_repair.py" \
+  "${PYTHON_BIN}" -u "${ROOT}/scripts/run_qwen_vjepa_spatial_prior_repair.py" \
   --wm-checkpoint "${SOURCE_WM}" \
   --data-dir "${DATA_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
