@@ -4,8 +4,9 @@ set -euo pipefail
 # FrozenLake Stage 2 configuration for the shared Qwen + V-JEPA-teacher
 # Reward-Head trainer.  This script never regenerates replay or updates the WM.
 
-ROOT="${MBRL0901_ROOT:-/personal/jiayu2026/code/MBRL0901}"
-ENGINE_ROOT="${MBRL_ENGINE_ROOT:-/personal/jiayu2026/code/MBRL}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DWELL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+ENGINE_ROOT="${MBRL_ENGINE_ROOT:-${ROOT}}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-11}"
